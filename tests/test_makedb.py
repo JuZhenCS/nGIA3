@@ -50,9 +50,13 @@ class MakeDbTests(unittest.TestCase):
 
         count = struct.unpack_from("<I", data, 0)[0]
         self.assertEqual(count, 2)
-        packed_offsets = struct.unpack_from("<2Q", data, 4)
-        fasta_offsets = struct.unpack_from("<2Q", data, 20)
-        signature_end = 4 + count * 16 + count * SIGNATURE_COUNT * 4
+        name_lengths = struct.unpack_from("<2I", data, 4)
+        read_lengths = struct.unpack_from("<2I", data, 12)
+        packed_offsets = struct.unpack_from("<2Q", data, 20)
+        fasta_offsets = struct.unpack_from("<2Q", data, 36)
+        self.assertEqual(name_lengths, (2, 2))
+        self.assertEqual(read_lengths, (7, 4))
+        signature_end = 4 + count * 24 + count * SIGNATURE_COUNT * 4
         self.assertEqual(packed_offsets[0], signature_end)
         self.assertEqual(struct.unpack_from("<I", data, packed_offsets[0])[0], 7)
         self.assertEqual(struct.unpack_from("<I", data, packed_offsets[1])[0], 4)

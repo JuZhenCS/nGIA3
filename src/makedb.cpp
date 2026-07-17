@@ -2,6 +2,8 @@
 makedb.cpp
 输出文件数据内容:
   uint32_t         序列数         1
+  uint32_t[seqCount] nameLengths   序列名长度
+  uint32_t[seqCount] readLengths   序列长度
   vector<uint64_t> packed数据偏移  seqCount
   vector<uint64_t> fasta数据偏移   seqCount
   MinHash签名      uint32_t[128] * seqCount
@@ -51,7 +53,7 @@ struct SequenceIndex {  // 序列索引
   uint64_t fastaOffset;  // fasta文件偏移
   uint64_t packedOffsetPack;  // packed文件中 打包偏移
   uint64_t packedOffsetSeq;  // packed文件中 序列偏移
-  uint64_t nameLength;  // 序列名字长度
+  uint32_t nameLength;  // 序列名字长度
   uint32_t readLength;  // 序列数据长度
   uint64_t seqLength;  // 序列记录长度 名字+数据+换行
 };
@@ -191,8 +193,11 @@ inline std::vector<SequenceIndex> makeIndex(const std::string& fastaFile) {
       }
       seqCount += 1;  // 文件中的序列总数
       if (readLength < MAX_SEQUENCE_LENGTH) {
+        if (nameLength > std::numeric_limits<uint32_t>::max()) {
+          throw std::runtime_error("FASTA header exceeds uint32_t length");
+        }
         indices.push_back({
-          fastaOffset, 0, 0, nameLength,
+          fastaOffset, 0, 0, static_cast<uint32_t>(nameLength),
           static_cast<uint32_t>(readLength), seqLength
         });
       }
@@ -210,7 +215,8 @@ inline std::vector<SequenceIndex> makeIndex(const std::string& fastaFile) {
     );
     std::cout << "finish\n";
     std::cout << "index:\t" << std::flush;
-    uint64_t baseOffset = sizeof(uint32_t) + indices.size() * sizeof(uint64_t) * 2;
+    uint64_t baseOffset = sizeof(uint32_t);
+    baseOffset += indices.size() * (sizeof(uint32_t) * 2 + sizeof(uint64_t) * 2);
     baseOffset += indices.size() * sizeof(uint32_t) * SIGNATURE_COUNT;
     for (size_t i = 0; i < indices.size(); ++i) {
       indices[i].packedOffsetPack = baseOffset;
@@ -258,12 +264,20 @@ inline void packData(const std::string& fastaFile, const std::string& packedFile
     std::ios::binary | std::ios::in | std::ios::out | std::ios::trunc);
   if (!fileOut) { throw std::runtime_error("cannot open packed output"); }
   fileOut.write(reinterpret_cast<const char*>(&seqCount), sizeof(seqCount));
+  std::vector<uint32_t> nameLengths(seqCount);
+  std::vector<uint32_t> readLengths(seqCount);
   std::vector<uint64_t> packOffsets(seqCount);
   std::vector<uint64_t> seqOffsets(seqCount);
   for (uint32_t i = 0; i < seqCount; ++i) {
+    nameLengths[i] = indices[i].nameLength;
+    readLengths[i] = indices[i].readLength;
     packOffsets[i] = indices[i].packedOffsetPack;
     seqOffsets[i] = indices[i].packedOffsetSeq;
   }
+  fileOut.write(reinterpret_cast<const char*>(nameLengths.data()),
+                seqCount * sizeof(uint32_t));
+  fileOut.write(reinterpret_cast<const char*>(readLengths.data()),
+                seqCount * sizeof(uint32_t));
   fileOut.write(reinterpret_cast<const char*>(packOffsets.data()),
                 seqCount * sizeof(uint64_t));
   fileOut.write(reinterpret_cast<const char*>(seqOffsets.data()),
@@ -271,7 +285,8 @@ inline void packData(const std::string& fastaFile, const std::string& packedFile
   if (!fileOut) { throw std::runtime_error("failed to write packed header"); }
 
   std::cout << "pack:\t" << std::flush;
-  const uint64_t groupBase = sizeof(uint32_t) + seqCount * sizeof(uint64_t) * 2;
+  const uint64_t groupBase = sizeof(uint32_t) +
+    seqCount * (sizeof(uint32_t) * 2 + sizeof(uint64_t) * 2);
   std::atomic_bool ioFailed{false};
   #pragma omp parallel shared(fileOut, ioFailed)
 

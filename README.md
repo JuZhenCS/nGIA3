@@ -39,8 +39,10 @@ file in the destination directory, then atomically replaces the destination.
 All integer fields are little-endian. Offsets are 64-bit values.
 
 1. One 32-bit retained sequence count.
-2. One packed-data offset per retained sequence.
-3. One normalized-FASTA offset per retained sequence.
-4. 128 32-bit MinHash signatures per retained sequence.
-5. Four bit-plane words per block of 32 residues, prefixed by sequence length.
-6. Normalized FASTA records, each using one sequence line and LF delimiters.
+2. One 32-bit FASTA-name length per retained sequence.
+3. One 32-bit sequence length per retained sequence.
+4. One packed-data offset per retained sequence.
+5. One normalized-FASTA offset per retained sequence.
+6. 128 32-bit MinHash signatures per retained sequence.
+7. Four bit-plane words per block of 32 residues, prefixed by sequence length.
+8. Normalized FASTA records, each using one sequence line and LF delimiters.

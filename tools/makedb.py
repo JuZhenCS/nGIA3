@@ -244,7 +244,8 @@ def _calculate_offsets(
     records: TypingSequence[FastaRecord],
 ) -> tuple[list[int], list[int], int]:
     count = len(records)
-    offset = _U32.size + count * _U64.size * 2
+    offset = _U32.size + count * _U32.size * 2
+    offset += count * _U64.size * 2
     offset += count * SIGNATURE_COUNT * _U32.size
     packed_offsets: list[int] = []
     for record in records:
@@ -286,6 +287,8 @@ def pack_database(
         ) as output:
             temporary_name = output.name
             output.write(_U32.pack(len(records)))
+            _write_u32_values(output, [len(record.name) for record in records])
+            _write_u32_values(output, [len(record.sequence) for record in records])
             _write_u64_values(output, packed_offsets)
             _write_u64_values(output, fasta_offsets)
 
