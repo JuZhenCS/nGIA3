@@ -1,0 +1,37 @@
+# nGIA3
+
+nGIA3 is a biological-sequence clustering tool. The current implementation
+provides the makedb database-packing stage.
+
+## Build and run the C++ packer
+
+    cd src
+    make
+    ./ngia3 makedb -f ../data/go.fas -p go.packed
+
+The input must end in a newline. The Python implementation accepts LF or CRLF
+and normalizes stored records to LF. Records with sequence length greater than
+or equal to 65535 are skipped. Retained records are stably sorted by decreasing
+sequence length before they are stored.
+
+## Independent Python reference packer
+
+tools/makedb.py independently implements the same 64-bit little-endian packed
+format. It uses NumPy automatically when installed and otherwise falls back to
+a slower, standard-library-only reference implementation.
+
+    python tools/makedb.py -f data/go.fas -p go.python.packed
+    python -m unittest discover -s tests -v
+
+For a supported FASTA input, the C++ and Python output files should have the
+same MD5 digest. The Python writer first creates and synchronizes a temporary
+file in the destination directory, then atomically replaces the destination.
+
+## Packed file layout
+
+All integer fields are little-endian. Offsets are 64-bit values.
+
+1. One 32-bit retained sequence count.
+2. One packed-data offset per retained sequence.
+3. One normalized-FASTA offset per retained sequence.
+4. 128 32-bit MinHash signatures per retained sequence.
