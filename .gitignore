@@ -22,7 +22,6 @@ result
 
 # Python
 __pycache__/
-*.py
 *.pyc
 *.pyo
 *.egg-info/
