@@ -1,19 +1,20 @@
 /*
 makeDB.hpp
 输出文件数据内容:
-  uint32_t         序列数         1
+  uint32_t         序列数           1
+  uint32_t[seqCount]  nameLengths  序列名字长度
+  uint32_t[seqCount]  readLengths  序列数据长度
   vector<size_t>   packed数据偏移  seqCount
   vector<size_t>   fasta数据偏移   seqCount
-  分组数据 (128*readsCount条记录)
-    vector<uint32_t> 序列对应的代表序列 readsCount
+  签名数据 (128*readsCount条记录)
+    vector<uint32_t> 序列对应的签名 readsCount
     ... (共128组)
-    vector<uint32_t> 序列对应的代表序列 readsCount
   packed数据 (readsCount条记录)
     uint32_t 数据长度 1
     uint32_t 压缩数据 (数据长度+31)/32*4
   fasta数据 (readsCount条记录)
-    string 序列名 1
-    string 序列 1
+    string 序列名含换行
+    string 序列含换行
 长度<=0xFFFF 数量<=0x7FFFFFFF
 用法:
 ngia2 makeDB -f fasta文件 -p packed文件
@@ -33,12 +34,12 @@ ngia2 makeDB -f fasta文件 -p packed文件
 #include <algorithm> // stable_sort
 #include <array>     // array
 #include <cstdint>   // uint32_t
-#include <cstdlib>   // exit, EXIT_FAILURE
 #include <omp.h>     // openmp
 #include "timer.hpp" // timer
 #include "parser.hpp" // parser
 
 namespace MakeDB {  // 命名空间
+
 //--------------------------------  数据结构  --------------------------------//
 struct Option {  // 输入选项
   std::string fastaFile;  // fasta文件
@@ -53,12 +54,6 @@ struct seqIndex {  // 序列索引
   uint32_t readLength;  // 序列数据长度
   uint32_t seqLength;  // 序列记录长度 名字+数据+换行
 };
-
-uint32_t lineContentLength(const std::string& line) {
-  const size_t carriageReturn =
-    (!line.empty() && line.back() == '\r') ? 1 : 0;
-  return static_cast<uint32_t>(line.size() - carriageReturn);
-}
 
 //--------------------------------  功能函数  --------------------------------//
 // init初始化
@@ -75,30 +70,25 @@ Option init(int argc, char** argv) {
   bool checkPassed = true;  // 校验是否通过
   {  // 校验参数
     // 1. 文件存在
-    std::ifstream fastaFile(option.fastaFile, std::ios::binary);  // fasta文件
+    std::ifstream fastaFile(option.fastaFile);  // fasta文件
     if (!fastaFile.good()) {  // 文件不存在
       std::cout << option.fastaFile << " does not exist.\n";
       checkPassed = false;
-    } else {
-      char previousChar = '\0';
-      char currentChar = '\0';
-      char lastChar = '\0';
-      bool bareCarriageReturn = false;
-      while (fastaFile.get(currentChar)) {
-        if (previousChar == '\r' && currentChar != '\n') {
-          bareCarriageReturn = true;
-        }
-        previousChar = currentChar;
-        lastChar = currentChar;
-      }
-      if (previousChar == '\r') {
-        bareCarriageReturn = true;
-      }
-      if (bareCarriageReturn) {
-        std::cout << "File contains a bare \\r character.\n";
-        checkPassed = false;
-      }
-      if (lastChar != '\0' && lastChar != '\n') {
+    }
+    // 2. 行尾没有\r，只\n换行
+    std::string line;  // 一行数据
+    getline(fastaFile, line);
+    if (!line.empty() && line.back() == '\r') {  // 行尾有\r
+      std::cout << "Please remove the \\r at the end of lines.\n";
+      checkPassed = false;
+    }
+    // 3. 文件以换行结尾
+    fastaFile.seekg(0, std::ios::end);
+    if (fastaFile.tellg() > 0) {
+      fastaFile.seekg(-1, std::ios::end);
+      char lastChar;
+      fastaFile.read(&lastChar, 1);
+      if (lastChar != '\n') {
         std::cout << "File must end with \\n.\n";
         checkPassed = false;
       }
@@ -117,7 +107,7 @@ std::vector<seqIndex> makeIndex(const std::string& fastaFile) {
   uint32_t seqCount = 0;  // 扫描的序列数（含超长丢弃的）
   {  // 1. 从文件读序列索引
     std::cout << "read:\t." << std::flush;  // 进度条
-    std::ifstream fileIn(fastaFile, std::ios::binary);  // fasta文件
+    std::ifstream fileIn(fastaFile);  // fasta文件
     std::string line = "";  // 一行数据
     size_t fastaOffset = 0;  // fasta偏移
     uint32_t nameLength = 0;  // 序列名字长度
@@ -126,12 +116,12 @@ std::vector<seqIndex> makeIndex(const std::string& fastaFile) {
     while (fileIn.peek() != EOF && seqCount < 0x7FFFFFFF) {
       fastaOffset = fileIn.tellg();  // fasta偏移
       getline(fileIn, line);  // 读 >name 行
-      nameLength = lineContentLength(line);  // 序列名字长度
+      nameLength = line.size();  // 序列名字长度
       seqLength = line.size() + 1;  // 包括换行符
       readLength = 0;  // 序列数据长度
       while (fileIn.peek() != EOF && fileIn.peek() != '>') {
         getline(fileIn, line);  // 序列数据
-        readLength += lineContentLength(line);  // 序列数据长度
+        readLength += line.size();  // 序列数据长度
         seqLength += line.size() + 1;  // 包括换行符
       }
       seqCount += 1;  // 文件中的序列总数
@@ -162,7 +152,9 @@ std::vector<seqIndex> makeIndex(const std::string& fastaFile) {
     std::cout << "finish\n";
     std::cout << "index:\t" << std::flush;
     size_t baseOffset = 0;  // 基础偏移
-    baseOffset += sizeof(uint32_t) + indices.size() * sizeof(size_t) * 2;
+    baseOffset += sizeof(uint32_t)
+      + indices.size() * sizeof(uint32_t) * 2
+      + indices.size() * sizeof(size_t) * 2;
     baseOffset += indices.size() * sizeof(uint32_t) * 128;
     for (uint32_t i = 0; i < indices.size(); i++) {
       indices[i].packedOffsetPack = baseOffset;
@@ -196,49 +188,47 @@ const std::vector<seqIndex>& indices) {
     t['R']=13; t['S']=14; t['T']=15; t['V']= 8; t['W']= 5; t['Y']= 5;
     return t;
   }();
-  uint32_t seqCount = indices.size();  // 序列数
-  {  // 1. 写入文件头部：序列数、packed偏移表、fasta偏移表
+  const uint32_t seqCount = indices.size();  // 序列数
+  {  // 1. 写入文件头部：序列数、name/read净长度、packed偏移表、fasta偏移表
     std::ofstream fileOut(packedFile, std::ios::binary);
     fileOut.write((char*)&seqCount, sizeof(uint32_t));  // 序列数
+    std::vector<uint32_t> nameLengths(seqCount);  // 序列名字净长度
+    std::vector<uint32_t> readLengths(seqCount);  // 序列数据净长度
     std::vector<size_t> packOffsets(seqCount);  // 打包偏移
     std::vector<size_t> seqOffsets(seqCount);  // fasta偏移
     for (uint32_t i = 0; i < seqCount; i++) {
+      nameLengths[i] = indices[i].nameLength;  // 包含>
+      readLengths[i] = indices[i].readLength;
       packOffsets[i] = indices[i].packedOffsetPack;  // 打包偏移
       seqOffsets[i] = indices[i].packedOffsetSeq;  // fasta偏移
     }
+    fileOut.write((char*)nameLengths.data(), seqCount * sizeof(uint32_t));
+    fileOut.write((char*)readLengths.data(), seqCount * sizeof(uint32_t));
     fileOut.write((char*)packOffsets.data(), seqCount * sizeof(size_t));
     fileOut.write((char*)seqOffsets.data(), seqCount * sizeof(size_t));
-    fileOut.close();
   }
   {  // 2. 并发打包和签名，结果直接写入文件
     std::cout << "pack:\t" << std::flush;
-    const size_t groupBase = sizeof(uint32_t) + seqCount * sizeof(size_t) * 2;
+    const size_t signBase = sizeof(uint32_t) + seqCount * sizeof(size_t) * 2
+      + seqCount * sizeof(uint32_t) * 2;  // 签名的起始偏移
     #pragma omp parallel
     {  // 每个线程有单独的私有变量
-      std::ifstream fileIn(fastaFile, std::ios::binary);  // fasta文件
+      std::ifstream fileIn(fastaFile);  // fasta文件
       std::fstream fileOut(packedFile,
       std::ios::binary | std::ios::in | std::ios::out);  // packed文件
-      std::vector<uint32_t> packedBuffer(65536 / 32 * 4 + 1, 0);  // 打包后序列
-      std::vector<uint32_t> hashSigns(128, 0xFFFFFFFF);  // 128个哈希签名
+      std::vector<uint32_t> packedBuffer(65536 / 32 * 4 + 1);  // 打包后序列
+      std::vector<uint32_t> hashSigns(128);  // 128个哈希签名
       std::string name="", read="", line="";  // 名字、序列、行
       #pragma omp for schedule(dynamic, 1)
       for (uint32_t i = 0; i < seqCount; i++) {  // 遍历序列
         {  // 2.1 从fasta文件读取一条完整记录并解析
-          fileIn.clear();
           fileIn.seekg(indices[i].fastaOffset);  // 跳转到序列起始位置
-          line.assign(indices[i].seqLength, '\0');  // 分配并清空内存
+          line.resize(indices[i].seqLength);  // 分配内存
           fileIn.read(&line[0], indices[i].seqLength);  // 读数据
-          if (fileIn.gcount() != indices[i].seqLength) {
-            std::cerr << "Failed to read FASTA record at offset "
-                      << indices[i].fastaOffset << ".\n";
-            std::exit(EXIT_FAILURE);
-          }
           size_t pos = line.find('\n');  // 分割名字和序列
           name = line.substr(0, pos);  // 名字
-          if (!name.empty() && name.back() == '\r') { name.pop_back(); }
           read = line.substr(pos + 1);  // 序列
           read.erase(std::remove(read.begin(), read.end(), '\n'), read.end());
-          read.erase(std::remove(read.begin(), read.end(), '\r'), read.end());
         }
         {  // 2.2 打包 + 签名
           const uint32_t length = (uint32_t)read.size();  // 序列长度
@@ -270,7 +260,7 @@ const std::vector<seqIndex>& indices) {
           }
         }
         {  // 2.3 写入packed文件
-          fileOut.seekp(groupBase + i * 128 * sizeof(uint32_t));  // 写签名
+          fileOut.seekp(signBase + i * 128 * sizeof(uint32_t));  // 写签名
           fileOut.write((char*)hashSigns.data(), 128 * sizeof(uint32_t));
           fileOut.seekp(indices[i].packedOffsetPack);  // 写打包
           uint32_t lengthTemp = packedBuffer.size() * sizeof(uint32_t);
