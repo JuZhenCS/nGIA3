@@ -50,9 +50,13 @@ class MakeDbTests(unittest.TestCase):
 
         count = struct.unpack_from("<I", data, 0)[0]
         self.assertEqual(count, 2)
-        packed_offsets = struct.unpack_from("<2Q", data, 4)
-        fasta_offsets = struct.unpack_from("<2Q", data, 20)
-        signature_end = 4 + count * 16 + count * SIGNATURE_COUNT * 4
+        name_lengths = struct.unpack_from("<2I", data, 4)
+        read_lengths = struct.unpack_from("<2I", data, 12)
+        packed_offsets = struct.unpack_from("<2Q", data, 20)
+        fasta_offsets = struct.unpack_from("<2Q", data, 36)
+        self.assertEqual(name_lengths, (2, 2))
+        self.assertEqual(read_lengths, (7, 4))
+        signature_end = 4 + count * 24 + count * SIGNATURE_COUNT * 4
         self.assertEqual(packed_offsets[0], signature_end)
         self.assertEqual(struct.unpack_from("<I", data, packed_offsets[0])[0], 7)
         self.assertEqual(struct.unpack_from("<I", data, packed_offsets[1])[0], 4)
@@ -106,6 +110,15 @@ class MakeDbTests(unittest.TestCase):
             records = read_fasta(source)
         self.assertEqual(records[0].name, b">a")
         self.assertEqual(records[0].sequence, b"AC")
+
+    def test_rejects_input_output_alias_without_data_loss(self) -> None:
+        fixture = b">record\nACDEFGH\n"
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory, "input.fas")
+            source.write_bytes(fixture)
+            with self.assertRaises(FastaFormatError):
+                pack_database(source, source, engine="python")
+            self.assertEqual(source.read_bytes(), fixture)
 
     def test_rejects_ambiguous_input(self) -> None:
         invalid_inputs = (
