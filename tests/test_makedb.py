@@ -107,6 +107,15 @@ class MakeDbTests(unittest.TestCase):
         self.assertEqual(records[0].name, b">a")
         self.assertEqual(records[0].sequence, b"AC")
 
+    def test_rejects_input_output_alias_without_data_loss(self) -> None:
+        fixture = b">record\nACDEFGH\n"
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory, "input.fas")
+            source.write_bytes(fixture)
+            with self.assertRaises(FastaFormatError):
+                pack_database(source, source, engine="python")
+            self.assertEqual(source.read_bytes(), fixture)
+
     def test_rejects_ambiguous_input(self) -> None:
         invalid_inputs = (
             b">a\rAC\n",

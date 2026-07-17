@@ -2,7 +2,7 @@
 """Create an nGIA3 packed database from a FASTA file.
 
 The implementation is intentionally independent from the C++ code in
-src/makedb.hpp. It uses explicit little-endian, fixed-width fields so the
+src/makedb.cpp. It uses explicit little-endian, fixed-width fields so the
 database layout is reproducible on every 64-bit platform supported by nGIA3.
 NumPy is used automatically when available to accelerate MinHash generation;
 the standard-library implementation is the correctness reference and fallback.
@@ -26,6 +26,10 @@ KMER_MASK = (1 << 25) - 1
 SIGNATURE_COUNT = 128
 MAX_SEQUENCE_LENGTH = 0xFFFF  # The C++ implementation uses length < 0xffff.
 MAX_SEQUENCE_COUNT = 0x7FFFFFFF
+HASH_SEEDS = tuple(
+    (index * 0x9E3779B1 + 0x85EBCA6B) & UINT32_MASK
+    for index in range(SIGNATURE_COUNT)
+)
 
 _U32 = struct.Struct("<I")
 _U64 = struct.Struct("<Q")
@@ -80,16 +84,11 @@ def read_fasta(path: os.PathLike[str] | str) -> list[FastaRecord]:
     """
 
     fasta_path = Path(path)
-    data = fasta_path.read_bytes()
-    if data and not data.endswith(b"\n"):
-        raise FastaFormatError("FASTA file must end with a newline (LF)")
-    data = data.replace(b"\r\n", b"\n")
-    if b"\r" in data:
-        raise FastaFormatError("FASTA file contains a bare carriage return")
-
     records: list[FastaRecord] = []
     name: bytes | None = None
     sequence_parts: list[bytes] = []
+    sequence_count = 0
+    reached_limit = False
 
     def finish_record() -> None:
         if name is None:
@@ -98,21 +97,31 @@ def read_fasta(path: os.PathLike[str] | str) -> list[FastaRecord]:
         if len(sequence) < MAX_SEQUENCE_LENGTH:
             records.append(FastaRecord(name, sequence))
 
-    # splitlines() deliberately ignores the one terminal LF already validated.
-    for line_number, line in enumerate(data.splitlines(), start=1):
-        if line.startswith(b">"):
-            finish_record()
-            if len(records) >= MAX_SEQUENCE_COUNT:
-                break
-            name = line
-            sequence_parts = []
-        else:
-            if name is None:
-                raise FastaFormatError(
-                    f"line {line_number}: sequence data appears before a FASTA header"
-                )
-            sequence_parts.append(line)
-    else:
+    with fasta_path.open("rb") as source:
+        for line_number, raw_line in enumerate(source, start=1):
+            if not raw_line.endswith(b"\n"):
+                raise FastaFormatError("FASTA file must end with a newline (LF)")
+            line = raw_line[:-1]
+            if line.endswith(b"\r"):
+                line = line[:-1]
+            if b"\r" in line:
+                raise FastaFormatError("FASTA file contains a bare carriage return")
+            if line.startswith(b">"):
+                finish_record()
+                if sequence_count >= MAX_SEQUENCE_COUNT:
+                    reached_limit = True
+                    break
+                sequence_count += 1
+                name = line
+                sequence_parts = []
+            else:
+                if name is None:
+                    raise FastaFormatError(
+                        f"line {line_number}: sequence data appears before a FASTA header"
+                    )
+                sequence_parts.append(line)
+
+    if not reached_limit:
         finish_record()
 
     records.sort(key=lambda record: len(record.sequence), reverse=True)
@@ -151,8 +160,7 @@ def signatures_python(sequence: bytes) -> tuple[int, ...]:
 
     minimum = [UINT32_MASK] * SIGNATURE_COUNT
     for kmer in _iter_kmers(sequence):
-        for index in range(SIGNATURE_COUNT):
-            seed = (index * 0x9E3779B1 + 0x85EBCA6B) & UINT32_MASK
+        for index, seed in enumerate(HASH_SEEDS):
             value = _wang_hash(kmer, seed)
             if value < minimum[index]:
                 minimum[index] = value
@@ -223,13 +231,13 @@ def pack_sequence(sequence: bytes) -> tuple[int, ...]:
 
 
 def _write_u32_values(file_object, values: TypingSequence[int]) -> None:
-    for value in values:
-        file_object.write(_U32.pack(value))
+    if values:
+        file_object.write(struct.pack(f"<{len(values)}I", *values))
 
 
 def _write_u64_values(file_object, values: TypingSequence[int]) -> None:
-    for value in values:
-        file_object.write(_U64.pack(value))
+    if values:
+        file_object.write(struct.pack(f"<{len(values)}Q", *values))
 
 
 def _calculate_offsets(
@@ -258,9 +266,13 @@ def pack_database(
 ) -> int:
     """Create *packed_path* atomically and return the retained record count."""
 
-    records = read_fasta(fasta_path)
-    packed_offsets, fasta_offsets, final_size = _calculate_offsets(records)
+    source = Path(fasta_path)
     destination = Path(packed_path)
+    if destination.exists() and os.path.samefile(source, destination):
+        raise FastaFormatError("input FASTA and packed output must be different files")
+
+    records = read_fasta(source)
+    packed_offsets, fasta_offsets, final_size = _calculate_offsets(records)
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     temporary_name: str | None = None
