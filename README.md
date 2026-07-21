@@ -33,6 +33,10 @@ a slower, standard-library-only reference implementation.
 For a supported FASTA input, the C++ and Python output files should have the
 same MD5 digest. The Python writer first creates and synchronizes a temporary
 file in the destination directory, then atomically replaces the destination.
+By default it also reads the completed database back and verifies every length,
+offset, signature, packed sequence, normalized FASTA record, and the final file
+size against the input. Pass `--no-verify` only when this second correctness
+pass is not required.
 
 ## Packed file layout
 
