@@ -39,6 +39,10 @@ class FastaFormatError(ValueError):
     """Raised when the input cannot be interpreted unambiguously as FASTA."""
 
 
+class PackedDatabaseError(ValueError):
+    """Raised when a packed database does not match its source FASTA."""
+
+
 @dataclass(frozen=True, slots=True)
 class FastaRecord:
     """A normalized FASTA record stored as bytes for lossless output."""
@@ -240,6 +244,29 @@ def _write_u64_values(file_object, values: TypingSequence[int]) -> None:
         file_object.write(struct.pack(f"<{len(values)}Q", *values))
 
 
+def _read_exact(file_object, size: int, section: str) -> bytes:
+    data = file_object.read(size)
+    if len(data) != size:
+        raise PackedDatabaseError(
+            f"truncated {section}: expected {size} bytes, found {len(data)}"
+        )
+    return data
+
+
+def _read_u32_values(file_object, count: int, section: str) -> tuple[int, ...]:
+    if count == 0:
+        return ()
+    data = _read_exact(file_object, count * _U32.size, section)
+    return struct.unpack(f"<{count}I", data)
+
+
+def _read_u64_values(file_object, count: int, section: str) -> tuple[int, ...]:
+    if count == 0:
+        return ()
+    data = _read_exact(file_object, count * _U64.size, section)
+    return struct.unpack(f"<{count}Q", data)
+
+
 def _calculate_offsets(
     records: TypingSequence[FastaRecord],
 ) -> tuple[list[int], list[int], int]:
@@ -318,6 +345,108 @@ def pack_database(
             except FileNotFoundError:
                 pass
     return len(records)
+def verify_packed_database(
+    fasta_path: os.PathLike[str] | str,
+    packed_path: os.PathLike[str] | str,
+    *,
+    engine: SignatureEngine = "auto",
+) -> int:
+    """Verify every packed section against *fasta_path* and return its count.
+
+    This is intentionally a read-back check: it does not trust the stored
+    lengths or offsets when deciding how much data to read. Instead, it derives
+    the expected layout from the source FASTA and compares every serialized
+    field, including the final file boundary.
+    """
+
+    records = read_fasta(fasta_path)
+    expected_count = len(records)
+    expected_packed_offsets, expected_fasta_offsets, expected_size = (
+        _calculate_offsets(records)
+    )
+
+    with Path(packed_path).open("rb") as packed:
+        actual_count = _U32.unpack(_read_exact(packed, _U32.size, "record count"))[0]
+        if actual_count != expected_count:
+            raise PackedDatabaseError(
+                f"record count mismatch: expected {expected_count}, found {actual_count}"
+            )
+
+        expected_name_lengths = tuple(len(record.name) for record in records)
+        expected_read_lengths = tuple(len(record.sequence) for record in records)
+        sections = (
+            (
+                "name lengths",
+                _read_u32_values(packed, expected_count, "name lengths"),
+                expected_name_lengths,
+            ),
+            (
+                "read lengths",
+                _read_u32_values(packed, expected_count, "read lengths"),
+                expected_read_lengths,
+            ),
+            (
+                "packed offsets",
+                _read_u64_values(packed, expected_count, "packed offsets"),
+                tuple(expected_packed_offsets),
+            ),
+            (
+                "FASTA offsets",
+                _read_u64_values(packed, expected_count, "FASTA offsets"),
+                tuple(expected_fasta_offsets),
+            ),
+        )
+        for section, actual, expected in sections:
+            if actual != expected:
+                mismatch = next(
+                    index
+                    for index, values in enumerate(zip(actual, expected))
+                    if values[0] != values[1]
+                )
+                raise PackedDatabaseError(
+                    f"{section} mismatch at record {mismatch}: "
+                    f"expected {expected[mismatch]}, found {actual[mismatch]}"
+                )
+
+        for index, record in enumerate(records):
+            actual = _read_u32_values(
+                packed, SIGNATURE_COUNT, f"signatures for record {index}"
+            )
+            expected = make_signatures(record.sequence, engine)
+            if actual != expected:
+                raise PackedDatabaseError(f"signature mismatch at record {index}")
+
+        for index, (expected_offset, record) in enumerate(
+            zip(expected_packed_offsets, records)
+        ):
+            if packed.tell() != expected_offset:
+                raise PackedDatabaseError(f"packed offset mismatch at record {index}")
+            expected = pack_sequence(record.sequence)
+            actual = _read_u32_values(
+                packed, len(expected), f"packed sequence for record {index}"
+            )
+            if actual != expected:
+                raise PackedDatabaseError(f"packed sequence mismatch at record {index}")
+
+        for index, (expected_offset, record) in enumerate(
+            zip(expected_fasta_offsets, records)
+        ):
+            if packed.tell() != expected_offset:
+                raise PackedDatabaseError(f"FASTA offset mismatch at record {index}")
+            expected = record.name + b"\n" + record.sequence + b"\n"
+            actual = _read_exact(packed, len(expected), f"FASTA record {index}")
+            if actual != expected:
+                raise PackedDatabaseError(f"FASTA payload mismatch at record {index}")
+
+        if packed.tell() != expected_size:
+            raise PackedDatabaseError(
+                f"file size mismatch: expected {expected_size}, found {packed.tell()}"
+            )
+        if packed.read(1):
+            raise PackedDatabaseError(f"trailing data after byte {expected_size}")
+    return expected_count
+
+
 
 
 def md5sum(path: os.PathLike[str] | str) -> str:
@@ -340,6 +469,12 @@ def _parse_args(argv: TypingSequence[str] | None = None) -> argparse.Namespace:
         default="auto",
         help="signature implementation (default: NumPy when installed, otherwise Python)",
     )
+    parser.add_argument(
+        "--no-verify",
+        action="store_false",
+        dest="verify",
+        help="skip the default full read-back verification",
+    )
     return parser.parse_args(argv)
 
 
@@ -347,10 +482,14 @@ def main(argv: TypingSequence[str] | None = None) -> int:
     args = _parse_args(argv)
     try:
         count = pack_database(args.fasta, args.packed, engine=args.engine)
-    except (OSError, FastaFormatError, RuntimeError) as exc:
+        if args.verify:
+            verify_packed_database(args.fasta, args.packed, engine=args.engine)
+    except (OSError, FastaFormatError, PackedDatabaseError, RuntimeError) as exc:
         print(f"makedb: error: {exc}", file=sys.stderr)
         return 1
     print(f"packed {count} sequences into {args.packed}")
+    if args.verify:
+        print("verification: passed")
     print(f"md5: {md5sum(args.packed)}")
     return 0
 

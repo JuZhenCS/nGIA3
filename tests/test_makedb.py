@@ -9,12 +9,14 @@ import unittest
 
 from tools.makedb import (
     FastaFormatError,
+    PackedDatabaseError,
     SIGNATURE_COUNT,
     make_signatures,
     pack_database,
     pack_sequence,
     read_fasta,
     signatures_python,
+    verify_packed_database,
 )
 
 
@@ -61,6 +63,34 @@ class MakeDbTests(unittest.TestCase):
         self.assertEqual(struct.unpack_from("<I", data, packed_offsets[0])[0], 7)
         self.assertEqual(struct.unpack_from("<I", data, packed_offsets[1])[0], 4)
         self.assertEqual(data[fasta_offsets[0] :], b">b\nACDEFGH\n>a\nACDX\n")
+    def test_read_back_verifier_checks_every_section(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory, "input.fas")
+            output = Path(directory, "output.packed")
+            source.write_bytes(b">a\nACDX\n>b\nACDEFGH\n")
+            pack_database(source, output, engine="python")
+            self.assertEqual(
+                verify_packed_database(source, output, engine="python"),
+                2,
+            )
+
+            damaged = bytearray(output.read_bytes())
+            damaged[-2] ^= 1
+            output.write_bytes(damaged)
+            with self.assertRaisesRegex(PackedDatabaseError, "FASTA payload"):
+                verify_packed_database(source, output, engine="python")
+
+    def test_read_back_verifier_rejects_trailing_data(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory, "input.fas")
+            output = Path(directory, "output.packed")
+            source.write_bytes(b">a\nACDX\n")
+            pack_database(source, output, engine="python")
+            with output.open("ab") as packed:
+                packed.write(b"unexpected")
+            with self.assertRaisesRegex(PackedDatabaseError, "trailing data"):
+                verify_packed_database(source, output, engine="python")
+
 
     def test_command_line_entry_point_creates_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -85,6 +115,7 @@ class MakeDbTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue(output.is_file())
+            self.assertIn("verification: passed", result.stdout)
             self.assertIn("md5:", result.stdout)
 
     def test_numpy_and_reference_signatures_match(self) -> None:
