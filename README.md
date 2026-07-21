@@ -21,6 +21,11 @@ normalize stored records to LF. Records with sequence length greater than or
 equal to 65535 are skipped. Retained records are stably sorted by decreasing
 sequence length before they are stored.
 
+The C++ packer validates FASTA line endings while building the index, avoiding
+a separate full-file validation pass. It builds the database in a unique
+temporary file beside the destination and replaces the destination only after
+all data has been flushed successfully; failed runs clean up the temporary file.
+
 ## Independent Python reference packer
 
 tools/makedb.py independently implements the same 64-bit little-endian packed
