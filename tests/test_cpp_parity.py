@@ -19,7 +19,16 @@ class CppParityTests(unittest.TestCase):
         if not cls.binary.is_file():
             raise unittest.SkipTest(f"nGIA3 binary does not exist: {cls.binary}")
 
-    def run_cpp(self, source: Path, output: Path) -> subprocess.CompletedProcess[str]:
+    def run_cpp(
+        self,
+        source: Path,
+        output: Path,
+        *,
+        threads: int | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        environment = os.environ.copy()
+        if threads is not None:
+            environment["OMP_NUM_THREADS"] = str(threads)
         return subprocess.run(
             [
                 str(self.binary),
@@ -32,6 +41,7 @@ class CppParityTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
+            env=environment,
         )
 
     def test_cpp_and_python_outputs_are_byte_identical(self) -> None:
@@ -51,6 +61,60 @@ class CppParityTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             pack_database(source, python_output, engine="python")
             self.assertEqual(cpp_output.read_bytes(), python_output.read_bytes())
+
+    def test_cpp_output_is_deterministic_across_thread_counts(self) -> None:
+        fixture = b">a\nACDEFGHIKLMNPQRSTVWY\n>b\nacdx\n>empty\n"
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory, "input.fas")
+            one_thread = Path(directory, "one.packed")
+            four_threads = Path(directory, "four.packed")
+            source.write_bytes(fixture)
+
+            one_result = self.run_cpp(source, one_thread, threads=1)
+            four_result = self.run_cpp(source, four_threads, threads=4)
+            self.assertEqual(one_result.returncode, 0, one_result.stderr)
+            self.assertEqual(four_result.returncode, 0, four_result.stderr)
+            self.assertEqual(one_thread.read_bytes(), four_threads.read_bytes())
+
+    def test_cpp_atomically_replaces_existing_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory, "input.fas")
+            output = Path(directory, "output.packed")
+            expected = Path(directory, "expected.packed")
+            source.write_bytes(b">record\nACDEFGH\n")
+            output.write_bytes(b"previous database")
+            pack_database(source, expected, engine="python")
+
+            result = self.run_cpp(source, output)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(output.read_bytes(), expected.read_bytes())
+            self.assertEqual(list(Path(directory).glob("output.packed.tmp.*")), [])
+
+    def test_cpp_cleans_temporary_output_if_commit_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory, "input.fas")
+            output = Path(directory, "database")
+            marker = Path(output, "keep.txt")
+            source.write_bytes(b">record\nACDEFGH\n")
+            output.mkdir()
+            marker.write_text("keep", encoding="utf-8")
+
+            result = self.run_cpp(source, output)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
+            self.assertEqual(list(Path(directory).glob("database.tmp.*")), [])
+
+    def test_cpp_preserves_existing_output_for_missing_final_newline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory, "invalid.fas")
+            output = Path(directory, "output.packed")
+            source.write_bytes(b">record\nACDEFGH")
+            output.write_bytes(b"previous database")
+
+            result = self.run_cpp(source, output)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(output.read_bytes(), b"previous database")
+            self.assertEqual(list(Path(directory).glob("output.packed.tmp.*")), [])
 
     def test_cpp_rejects_input_output_alias_without_data_loss(self) -> None:
         fixture = b">record\nACDEFGH\n"

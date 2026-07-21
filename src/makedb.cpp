@@ -26,14 +26,24 @@ ngia3 makedb -f fasta文件 -p packed文件
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <random>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 #include <omp.h>
 
@@ -62,6 +72,63 @@ inline size_t lineContentLength(const std::string& line) {
   const size_t carriageReturn =
     (!line.empty() && line.back() == '\r') ? 1 : 0;
   return line.size() - carriageReturn;
+}
+
+bool readValidatedLine(std::ifstream& input, std::string& line) {
+  line.clear();
+  if (!std::getline(input, line)) {
+    if (input.eof()) { return false; }
+    throw std::runtime_error("failed while reading FASTA input");
+  }
+  if (input.eof()) {
+    throw std::runtime_error("FASTA file must end with a newline (LF)");
+  }
+  const size_t carriageReturn = line.find('\r');
+  if (carriageReturn != std::string::npos &&
+      carriageReturn + 1 != line.size()) {
+    throw std::runtime_error("FASTA file contains a bare carriage return");
+  }
+  return true;
+}
+
+std::filesystem::path makeTemporaryOutputPath(
+    const std::filesystem::path& destination) {
+  const uint64_t clockSeed = static_cast<uint64_t>(
+    std::chrono::high_resolution_clock::now().time_since_epoch().count());
+  std::random_device entropy;
+  const uint64_t entropyHigh = static_cast<uint64_t>(entropy());
+  const uint64_t entropyLow = static_cast<uint64_t>(entropy());
+  std::mt19937_64 generator(
+    clockSeed ^ (entropyHigh << 32) ^ entropyLow);
+  for (size_t attempt = 0; attempt < 128; ++attempt) {
+    std::filesystem::path candidate = destination;
+    candidate += ".tmp.";
+    candidate += std::to_string(generator());
+    std::error_code error;
+    const bool alreadyExists = std::filesystem::exists(candidate, error);
+    if (error) {
+      throw std::filesystem::filesystem_error(
+        "cannot inspect temporary output path", candidate, error);
+    }
+    if (!alreadyExists) { return candidate; }
+  }
+  throw std::runtime_error("cannot create a unique temporary output path");
+}
+
+void replaceOutputFile(const std::filesystem::path& temporary,
+                       const std::filesystem::path& destination) {
+#ifdef _WIN32
+  const std::wstring temporaryName = temporary.wstring();
+  const std::wstring destinationName = destination.wstring();
+  if (!MoveFileExW(temporaryName.c_str(), destinationName.c_str(),
+                   MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    throw std::system_error(
+      static_cast<int>(GetLastError()), std::system_category(),
+      "cannot replace packed output");
+  }
+#else
+  std::filesystem::rename(temporary, destination);
+#endif
 }
 
 constexpr uint32_t MAX_SEQUENCE_LENGTH = 0xFFFF;
@@ -125,39 +192,10 @@ inline Option init(int argc, char** argv) {
     throw std::invalid_argument(
       "input FASTA and packed output must be different files");
   }
-  bool checkPassed = true;  // 校验是否通过
-  {  // 校验参数
-    // 1. 文件存在
-    std::ifstream fastaFile(option.fastaFile, std::ios::binary);  // fasta文件
-    if (!fastaFile.good()) {  // 文件不存在
-      std::cout << option.fastaFile << " does not exist.\n";
-      checkPassed = false;
-    } else {
-      char previousChar = '\0';
-      char currentChar = '\0';
-      char lastChar = '\0';
-      bool bareCarriageReturn = false;
-      while (fastaFile.get(currentChar)) {
-        if (previousChar == '\r' && currentChar != '\n') {
-          bareCarriageReturn = true;
-        }
-        previousChar = currentChar;
-        lastChar = currentChar;
-      }
-      if (previousChar == '\r') {
-        bareCarriageReturn = true;
-      }
-      if (bareCarriageReturn) {
-        std::cout << "File contains a bare \\r character.\n";
-        checkPassed = false;
-      }
-      if (lastChar != '\0' && lastChar != '\n') {
-        std::cout << "File must end with \\n.\n";
-        checkPassed = false;
-      }
-    }
+  std::ifstream fastaFile(option.fastaFile, std::ios::binary);
+  if (!fastaFile) {
+    throw std::runtime_error("cannot open FASTA input: " + option.fastaFile);
   }
-  if (!checkPassed) { throw std::runtime_error("input validation failed"); }
   std::cout << "fasta:\t" << option.fastaFile << "\n";  // 输入数据
   std::cout << "packed:\t" << option.packedFile << "\n";  // 打包输出
   std::cout << "thread:\t" << omp_get_max_threads() << "\n";  // 可用线程数
@@ -170,7 +208,10 @@ inline std::vector<SequenceIndex> makeIndex(const std::string& fastaFile) {
   uint32_t seqCount = 0;  // 扫描的序列数（含超长丢弃的）
   {  // 1. 从文件读序列索引
     std::cout << "read:\t." << std::flush;  // 进度条
-    std::ifstream fileIn(fastaFile, std::ios::binary);  // fasta文件
+    std::ifstream fileIn(fastaFile, std::ios::binary);
+    if (!fileIn) {
+      throw std::runtime_error("cannot open FASTA input: " + fastaFile);
+    }
     std::string line;  // 一行数据
     uint64_t fastaOffset = 0;  // fasta偏移
     uint64_t nameLength = 0;  // 序列名字长度
@@ -178,7 +219,9 @@ inline std::vector<SequenceIndex> makeIndex(const std::string& fastaFile) {
     uint64_t seqLength = 0;  // 序列长度
     while (fileIn.peek() != EOF && seqCount < MAX_SEQUENCE_COUNT) {
       fastaOffset = static_cast<uint64_t>(fileIn.tellg());  // fasta偏移
-      getline(fileIn, line);  // 读 >name 行
+      if (!readValidatedLine(fileIn, line)) {
+        throw std::runtime_error("unexpected end of FASTA input");
+      }
       if (line.empty() || line.front() != '>') {
         throw std::runtime_error(
           "invalid FASTA header at record " + std::to_string(seqCount + 1));
@@ -187,7 +230,9 @@ inline std::vector<SequenceIndex> makeIndex(const std::string& fastaFile) {
       seqLength = line.size() + 1;  // 包括换行符
       readLength = 0;  // 序列数据长度
       while (fileIn.peek() != EOF && fileIn.peek() != '>') {
-        getline(fileIn, line);  // 序列数据
+        if (!readValidatedLine(fileIn, line)) {
+          throw std::runtime_error("unexpected end of FASTA input");
+        }
         readLength += lineContentLength(line);  // 序列数据长度
         seqLength += line.size() + 1;  // 包括换行符
       }
@@ -203,8 +248,18 @@ inline std::vector<SequenceIndex> makeIndex(const std::string& fastaFile) {
       }
       if (seqCount % (1024 * 1024) == 0) { std::cout << "." << std::flush; }
     }
+    const int nextCharacter = fileIn.peek();
+    if (fileIn.bad()) {
+      throw std::runtime_error("failed while reading FASTA input");
+    }
+    const bool reachedSequenceLimit = nextCharacter != EOF;
+    if (reachedSequenceLimit) {
+      while (readValidatedLine(fileIn, line)) {
+        // Preserve validation of the unindexed remainder.
+      }
+    }
     std::cout << " finish\n";
-    if (fileIn.peek() != EOF) { std::cout << "Max sequence count reached.\n"; }
+    if (reachedSequenceLimit) { std::cout << "Max sequence count reached.\n"; }
   }
   {  // 2. 从索引计算packed偏移
     std::cout << "sort:\t" << std::flush;
@@ -282,6 +337,20 @@ inline void packData(const std::string& fastaFile, const std::string& packedFile
                 seqCount * sizeof(uint64_t));
   fileOut.write(reinterpret_cast<const char*>(seqOffsets.data()),
                 seqCount * sizeof(uint64_t));
+  uint64_t finalSize = sizeof(uint32_t);
+  if (!indices.empty()) {
+    const SequenceIndex& last = indices.back();
+    finalSize = last.packedOffsetSeq + last.nameLength + last.readLength + 2;
+  }
+  if (finalSize > static_cast<uint64_t>(
+      std::numeric_limits<std::streamoff>::max())) {
+    throw std::runtime_error("packed output exceeds stream offset range");
+  }
+  if (finalSize > sizeof(uint32_t)) {
+    fileOut.seekp(static_cast<std::streamoff>(finalSize - 1));
+    fileOut.put('\0');
+  }
+  fileOut.flush();
   if (!fileOut) { throw std::runtime_error("failed to write packed header"); }
 
   std::cout << "pack:\t" << std::flush;
@@ -291,7 +360,7 @@ inline void packData(const std::string& fastaFile, const std::string& packedFile
   #pragma omp parallel shared(fileOut, ioFailed)
 
     {  // 每个线程有单独的私有变量
-      std::ifstream fileIn(fastaFile, std::ios::binary);  // fasta文件
+      std::ifstream fileIn(fastaFile, std::ios::binary);
       if (!fileIn) { ioFailed.store(true, std::memory_order_relaxed); }
       std::vector<uint32_t> packedBuffer;
       packedBuffer.reserve(1 + (MAX_SEQUENCE_LENGTH + 31) / 32 * 4);
@@ -315,11 +384,24 @@ inline void packData(const std::string& fastaFile, const std::string& packedFile
             continue;
           }
           const size_t pos = line.find('\n');
-          name = line.substr(0, pos);
+          if (pos == std::string::npos) {
+            ioFailed.store(true, std::memory_order_relaxed);
+            continue;
+          }
+          name.assign(line.data(), pos);
           if (!name.empty() && name.back() == '\r') { name.pop_back(); }
-          read = line.substr(pos + 1);
-          read.erase(std::remove(read.begin(), read.end(), '\n'), read.end());
-          read.erase(std::remove(read.begin(), read.end(), '\r'), read.end());
+          read.clear();
+          read.reserve(indices[i].readLength);
+          for (size_t offset = pos + 1; offset < line.size(); ++offset) {
+            const char residue = line[offset];
+            if (residue != '\n' && residue != '\r') { read.push_back(residue); }
+          }
+          if (name.empty() || name.front() != '>' ||
+              name.size() != indices[i].nameLength ||
+              read.size() != indices[i].readLength) {
+            ioFailed.store(true, std::memory_order_relaxed);
+            continue;
+          }
         }
         {  // 2.2 打包 + 签名
           const uint32_t length = static_cast<uint32_t>(read.size());
@@ -338,7 +420,7 @@ inline void packData(const std::string& fastaFile, const std::string& packedFile
             if (j < 6 && j < length - 1) { continue; }  // 前6个不签名
             for (size_t k = 0; k < SIGNATURE_COUNT; ++k) {
               const uint32_t sign = wangHash(kmer, seeds[k]);
-              if (sign < hashSigns[k]) { hashSigns[k] = sign; }
+              hashSigns[k] = std::min(hashSigns[k], sign);
             }
           }
         }
@@ -391,7 +473,16 @@ void makeDB(int argc, char** argv) {
   // 2. 构建索引
   std::vector<SequenceIndex> indices = makeIndex(option.fastaFile);
   // 3. 打包数据
-  packData(option.fastaFile, option.packedFile, indices);
+  const std::filesystem::path destination(option.packedFile);
+  const std::filesystem::path temporary = makeTemporaryOutputPath(destination);
+  try {
+    packData(option.fastaFile, temporary.string(), indices);
+    replaceOutputFile(temporary, destination);
+  } catch (...) {
+    std::error_code cleanupError;
+    std::filesystem::remove(temporary, cleanupError);
+    throw;
+  }
 
   timer.printStamp();
   timer.printDuration();
